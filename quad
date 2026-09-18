@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# quad — 4-panel tmux sessions, one per project
+#
+# Usage:
+#   quad            2x2 grid for the current directory
+#   quad name       fresh date-stamped dir ($QUAD_HOME/YYYY-MM-DD-name) + its own grid
+#   quad /path      2x2 grid for that directory (created if missing)
+#   quad new [name] run the try selector to create/pick a try dir, then grid it
+#   quad -l         list running quad sessions
+#
+# Each pane runs `ollama` (the interactive menu).
+
+set -euo pipefail
+
+QUAD_HOME="${QUAD_HOME:-$HOME/Projects}"
+# try.rb defaults to ~/src/tries when this is unset; keep quads in Work/tries
+export TRY_PATH="${TRY_PATH:-$HOME/Work/tries}"
+
+if [[ "${1:-}" == "-l" || "${1:-}" == "--list" ]]; then
+  exec tmux list-sessions 2>/dev/null || echo "no tmux sessions"
+fi
+
+# Resolve the working directory
+ARG="${1:-}"
+
+# quad new [name] — run the try selector (TUI goes to /dev/tty), eval the
+# cd-script it emits so the directory is created, and grid that directory.
+if [[ "$ARG" == "new" ]]; then
+  shift
+  local_out=$(/usr/bin/env ruby /usr/lib/tobi-try/try.rb exec "$@" 2>/dev/tty) || {
+    echo "$local_out"
+    exit 1
+  }
+  ARG="$( eval "$local_out" >/dev/null 2>&1; pwd )"
+  [[ -d "$ARG" ]] || { echo "try did not produce a directory" >&2; exit 1; }
+fi
+
+if [[ -z "$ARG" ]]; then
+  DIR="$PWD"
+elif [[ "$ARG" == */* ]]; then
+  DIR="$ARG"
+else
+  # Bare name → try-style date-stamped directory
+  DIR="$QUAD_HOME/$(date +%F)-$ARG"
+fi
+mkdir -p "$DIR"
+DIR="$(realpath "$DIR")"
+
+# One session per directory, named after it. tmux target names can't
+# contain '.', ':' or spaces, so replace those with '-'.
+SESSION="$(basename "$DIR" | sed 's/[.:/ ]/-/g')"
+[[ -z "$SESSION" ]] && SESSION="quad"
+
+# tmux doesn't allow nested sessions, so from inside tmux we switch-client
+# instead of attach.
+goto() {
+  if [[ -n "${TMUX:-}" ]]; then
+    exec tmux switch-client -t "$SESSION"
+  else
+    exec tmux attach -t "$SESSION"
+  fi
+}
+
+# If the session already exists: go to it if it's for this directory,
+# otherwise rebuild it for the new one
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  EXISTING_DIR="$(tmux show-options -v -t "$SESSION" '@dir' 2>/dev/null || true)"
+  if [[ "$EXISTING_DIR" == "$DIR" ]]; then
+    goto
+  fi
+  tmux kill-session -t "$SESSION"
+fi
+
+# Commands per pane — edit these to taste
+# ollama            → interactive Ollama menu (pick an integration/model)
+# ollama launch claude -- --dangerously-skip-permissions  → Claude Code via Ollama
+OLLAMA_CMD='ollama'
+PANE1="$OLLAMA_CMD"
+PANE2="$OLLAMA_CMD"
+PANE3="$OLLAMA_CMD"
+PANE4="$OLLAMA_CMD"
+
+# Create a detached session in the target directory
+WIN=$(tmux new-session -d -s "$SESSION" -n main -c "$DIR" -P -F '#{window_id}')
+tmux set-option -t "$SESSION" '@dir' "$DIR"
+
+# Build a 2x2 grid, keeping pane IDs so we target them regardless of indexing
+P1=$(tmux list-panes -t "$WIN" -F '#{pane_id}')
+P2=$(tmux split-window -h -t "$P1" -c "$DIR" -P -F '#{pane_id}')
+P3=$(tmux split-window -v -t "$P1" -c "$DIR" -P -F '#{pane_id}')
+P4=$(tmux split-window -v -t "$P2" -c "$DIR" -P -F '#{pane_id}')
+
+launch() {
+  local pane="$1" cmd="$2"
+  [[ -z "$cmd" ]] && return
+  tmux send-keys -t "$pane" "$cmd" C-m
+}
+launch "$P1" "$PANE1"
+launch "$P2" "$PANE2"
+launch "$P3" "$PANE3"
+launch "$P4" "$PANE4"
+
+tmux select-pane -t "$P1"
+goto
